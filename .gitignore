@@ -136,3 +136,8 @@ examples/runs
 data
 models
 output
+datasets/*
+zips/*
+checkpoint*
+azcopy*
+base-*
