@@ -262,6 +262,9 @@ class CaptionTensorizer(object):
                                                (self.max_masked_tokens - num_masked))
             masked_ids = self.tokenizer.convert_tokens_to_ids(masked_token)
         else:
+            # mask_pos_id = tokens.index(self.tokenizer.mask_token)
+            # masked_pos = torch.tensor(
+            #     [0] * mask_pos_id + [1] * (self.max_seq_len - mask_pos_id)).int()
             masked_pos = torch.ones(self.max_seq_len, dtype=torch.int)
 
         # pad on the right for image captioning
@@ -331,7 +334,7 @@ if __name__ == "__main__":
                                 tokenizer=tokenizer,
                                 is_train=args.do_train,
                                 args=args)
-    dataloader = DataLoader(dataset, batch_size=4)
+    dataloader = DataLoader(dataset, batch_size=2048)
 
     batch = next(iter(dataloader))
     img_keys, batch = batch

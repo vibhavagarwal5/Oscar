@@ -122,5 +122,9 @@ def get_args():
                         help='Use constrained beam search for decoding')
     parser.add_argument('--min_constraints_to_satisfy', type=int, default=2,
                         help="minimum number of constraints to satisfy")
+
+    # for DDP
+    parser.add_argument("--local_rank", type=int, default=-1,
+                        help="For distributed training: local_rank")
     args = parser.parse_args()
     return args

@@ -1,5 +1,5 @@
 # Copyright (c) 2020 Microsoft Corporation. Licensed under the MIT license.
-'''
+'''TRAIN
 python oscar/run_captioning_vesnli.py     \
     --do_train     \
     --do_lower_case     \
@@ -13,6 +13,16 @@ python oscar/run_captioning_vesnli.py     \
     --gradient_accumulation_step=4     \
     --num_train_epochs 30     \
     --save_steps 5000
+
+
+TEST
+python oscar/run_captioning_vesnli.py \
+    --do_test \
+    --data_dir=/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE     \
+    --per_gpu_eval_batch_size 16 \
+    --num_beams 5 \
+    --max_gen_length 20 \
+    --eval_model_dir /home/hdd1/vibhav/VE-SNLI/Oscar/output/10_13_20_25_18/checkpoint-6-50000
 '''
 
 from __future__ import absolute_import, division, print_function
@@ -26,7 +36,7 @@ import time
 import json
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler, Subset
+from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler, Subset, DistributedSampler
 # from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -79,7 +89,9 @@ def save_checkpoint(model, tokenizer, args, epoch, global_step):
 
 def train(args, train_dataset, val_dataset, model, tokenizer):
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
-    train_sampler = RandomSampler(train_dataset)
+
+    train_sampler = RandomSampler(
+        train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     train_dataloader = DataLoader(train_dataset, sampler=train_sampler,
                                   batch_size=args.train_batch_size, num_workers=args.num_workers)
 
@@ -113,12 +125,17 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
     if args.n_gpu > 1:
         model = torch.nn.DataParallel(model)
 
+    # Distributed training (should be after apex fp16 initialization)
+    if args.local_rank != -1:
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[
+                                                          args.local_rank], output_device=args.local_rank, find_unused_parameters=True)
+
     logger.info("***** Running training *****")
     logger.info("  Num examples = %d", len(train_dataset))
     logger.info("  Num Epochs = %d", args.num_train_epochs)
     logger.info("  Batch size per GPU = %d", args.per_gpu_train_batch_size)
-    logger.info("  Total train batch size (w. parallel, & accumulation) = %d",
-                args.train_batch_size * args.gradient_accumulation_steps)
+    logger.info("  Total train batch size (w. parallel, distributed & accumulation) = %d",
+                args.train_batch_size * args.gradient_accumulation_steps * (torch.distributed.get_world_size() if args.local_rank != -1 else 1))
     logger.info("  Gradient Accumulation steps = %d",
                 args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
@@ -170,19 +187,24 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
                 scheduler.step()
                 optimizer.step()
                 model.zero_grad()
-                if global_step % args.logging_steps == 0:
+                # Log metrics
+                if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
+                    if args.local_rank not in [-1, 0]:
+                        torch.distributed.barrier()
                     logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f} ({:.4f}), "
                                 "score: {:.4f} ({:.4f})".format(epoch, global_step,
                                                                 optimizer.param_groups[0]["lr"], loss, global_loss /
                                                                 global_step,
                                                                 batch_acc, global_acc / global_step)
                                 )
+                    if args.local_rank == 0:
+                        torch.distributed.barrier()
+
                     # writer.add_scalar('Loss', loss, global_step)
                     # writer.add_scalar('Acc', global_acc /
                     #                   global_step, global_step)
 
-                if (args.save_steps > 0 and global_step % args.save_steps == 0) or \
-                        global_step == t_total:
+                if (args.local_rank in [-1, 0]) and (args.save_steps > 0 and global_step % args.save_steps == 0) or global_step == t_total:
                     checkpoint_dir = save_checkpoint(
                         model, tokenizer, args, epoch, global_step)
                     # # evaluation
@@ -313,7 +335,8 @@ def evaluate(args, val_dataset, model, tokenizer, output_dir):
 
 def test(args, test_dataset, model, tokenizer, predict_file):
     args.test_batch_size = args.per_gpu_eval_batch_size * max(1, args.n_gpu)
-    test_sampler = SequentialSampler(test_dataset)
+    test_sampler = SequentialSampler(
+        test_dataset) if args.local_rank == -1 else DistributedSampler(test_dataset)
     test_dataloader = DataLoader(test_dataset, sampler=test_sampler,
                                  batch_size=args.test_batch_size, num_workers=args.num_workers)
 
@@ -376,13 +399,14 @@ def test(args, test_dataset, model, tokenizer, predict_file):
                                })
             # captions, logprobs
             outputs = model(**inputs)
-            all_caps = outputs[0]  # batch_size * num_keep_best * max_len
-
-            for img_key, caps in zip(img_keys, all_caps):
-                res = []
-                for cap, conf in zip(caps, confs):
-                    cap = tokenizer.decode(
-                        cap.tolist(), skip_special_tokens=True)
+            all_generated = outputs[0]  # batch_size * num_keep_best * max_len
+            for img_key, input_ids, generated in zip(img_keys, batch[0], all_generated):
+                print('INPUT: ', tokenizer.decode(input_ids.tolist()))
+                print('GEN.: ', tokenizer.decode(generated.tolist()[0]))
+                # res = []
+                # for cap, conf in zip(generated, confs):
+                #     cap = tokenizer.decode(
+                #         cap.tolist(), skip_special_tokens=True)
                 #     res.append({'caption': cap, 'conf': conf.item()})
                 # if isinstance(img_key, torch.Tensor):
                 #     img_key = img_key.item()
@@ -420,25 +444,44 @@ def main():
     global logger
     # global logger, writer
 
-    args.device = torch.device(
-        "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
-    args.n_gpu = torch.cuda.device_count()
+    # Setup CUDA, GPU & distributed training
+    if args.local_rank == -1 or args.no_cuda:
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() and not args.no_cuda else "cpu")
+        args.n_gpu = torch.cuda.device_count()
+    else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        torch.distributed.init_process_group(backend='nccl')
+        args.n_gpu = 1
+    args.device = device
 
-    mkdir(args.output_dir)
-
-    t = datetime.today()
-    args.output_dir = op.join(args.output_dir,
-                              f"{t.month}_{t.day}_{t.hour}_{t.minute}_{t.second}")
-    if not op.exists(args.output_dir):
+    if args.do_train:
         mkdir(args.output_dir)
 
-    logger = setup_logger("vlpretrain", args.output_dir, 0)
-    logger.warning("Device: %s, n_gpu: %s", args.device, args.n_gpu)
+        t = datetime.today()
+        args.output_dir = op.join(args.output_dir,
+                                  f"{t.month}_{t.day}_{t.hour}_{t.minute}_{t.second}")
+        if not op.exists(args.output_dir):
+            mkdir(args.output_dir)
+
+        logger = setup_logger("vlpretrain", args.output_dir, args.local_rank)
+    else:
+        logger = setup_logger(
+            "vlpretrain", os.path.dirname(args.eval_model_dir), args.local_rank, 'test_log.txt')
+
+    logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s",
+                   args.local_rank, device, args.n_gpu, bool(args.local_rank != -1))
+
     set_seed(args.seed, args.n_gpu)
 
     # writer = SummaryWriter(log_dir=args.output_dir, flush_secs=60)
 
     # Load pretrained model and tokenizer
+    if args.local_rank not in [-1, 0]:
+        # Make sure only the first process in distributed training will download model & vocab
+        torch.distributed.barrier()
+
     config_class, model_class, tokenizer_class = BertConfig, BertForImageCaptioning, BertTokenizer
     if args.do_train:
         assert args.model_name_or_path is not None
@@ -463,6 +506,10 @@ def main():
         logger.info("Evaluate the following checkpoint: %s",
                     args.eval_model_dir)
         model = model_class.from_pretrained(args.eval_model_dir, config=config)
+
+    if args.local_rank == 0:
+        # Make sure only the first process in distributed training will download model & vocab
+        torch.distributed.barrier()
 
     model.to(args.device)
     logger.info("Training/evaluation parameters %s", args)
@@ -491,7 +538,7 @@ def main():
     #         logger.info(
     #             "Evaluation results saved to: {}".format(evaluate_file))
 
-    if args.do_test:
+    if args.do_test and args.local_rank in [-1, 0]:
         args = restore_training_settings(args)
         test_dataset = build_dataset('test', tokenizer, args, is_train=False)
         if args.n_gpu > 1:
@@ -501,7 +548,7 @@ def main():
         test(args, test_dataset, model, tokenizer, predict_file)
         logger.info("Prediction results saved to: {}".format(predict_file))
 
-    if args.do_eval:
+    if args.do_eval and args.local_rank in [-1, 0]:
         args = restore_training_settings(args)
         dev_dataset = build_dataset('dev', tokenizer, args, is_train=False)
         if args.n_gpu > 1:
