@@ -1,31 +1,35 @@
 # Copyright (c) 2020 Microsoft Corporation. Licensed under the MIT license.
 '''TRAIN
-python oscar/run_captioning_vesnli.py     \
+python seq_clf_gen_vesnli.py     \
     --do_train     \
     --do_lower_case     \
     --add_od_labels     \
-    --model_name_or_path pretrained_models/base-vg-labels/ep_67_588997     \
-    --data_dir=/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE     \
+    --model_name_or_path ../pretrained_models/base-vg-labels/ep_67_588997     \
+    --data_dir=/mnt/nas_vibhav/e-SNLI-VE     \
+    --image_data_dir=/mnt/nas_vibhav/det1_50_obj    \
+    --output_dir ../output/      \
     --max_seq_a_length=80     \
     --max_seq_length=110      \
     --learning_rate 0.00003     \
+    --drop_out 0.3     \
     --per_gpu_train_batch_size 16 \
     --gradient_accumulation_step=4     \
     --num_train_epochs 30     \
+    --num_labels 3 \
+    --classifier linear \
+    --cls_hidden_scale 3 \
     --save_steps 5000
 
 
 TEST
-CUDA_VISIBLE_DEVICES=0 python oscar/run_captioning_vesnli.py     \
-    --do_test     \
-    --data_dir=/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE         \
-    --per_gpu_eval_batch_size 1     \
-    --num_beams 5     \
-    --max_gen_length 80     \
-    --eval_model_dir /home/hdd1/vibhav/VE-SNLI/Oscar/output/10_13_20_25_18/checkpoint-6-50000 \
-    --max_seq_a_length=80     \
-    --max_seq_length=110 \
-    --small_data=1
+python run_captioning_vesnli.py \
+    --do_test \
+    --data_dir=/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE     \
+    --per_gpu_eval_batch_size 16 \
+    --num_beams 5 \
+    --max_gen_length 20 \
+    --eval_model_dir /home/hdd1/vibhav/VE-SNLI/ \
+        Oscar/output/10_13_20_25_18/checkpoint-6-50000
 '''
 
 from __future__ import absolute_import, division, print_function
@@ -40,7 +44,6 @@ import json
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler, Subset, DistributedSampler
-# from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import sys
 
@@ -54,11 +57,11 @@ from oscar.utils.caption_evaluate import (evaluate_on_coco_caption,
                                           evaluate_on_nocaps, ScstRewardCriterion)
 from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader
 from oscar.utils.cbs import FiniteStateMachineBuilder
-from oscar.modeling.modeling_bert import BertForImageCaptioning
+from oscar.modeling.modeling_bert import BertForImageCaptioning_SeqClf
 from transformers.pytorch_transformers import BertTokenizer, BertConfig
 from transformers.pytorch_transformers import AdamW, WarmupLinearSchedule, WarmupConstantSchedule
-from run_captioning_dataset_vesnli import *
-from run_captioning_args_vesnli import get_args
+from seq_clf_gen_vesnli_dataset import *
+from seq_clf_gen_vesnli_args import get_args
 
 
 def build_dataset(data_type, tokenizer, args, is_train=True):
@@ -145,11 +148,7 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
                 args.gradient_accumulation_steps)
     logger.info("  Total optimization steps = %d", t_total)
 
-    if args.scst:
-        scst_criterion = ScstRewardCriterion()
-        logger.info("  SCST training...")
-
-    global_step, global_loss, global_acc = 0, 0.0, 0.0
+    global_step, global_loss, global_clf_loss, global_acc, global_clf_acc = 0, 0.0, 0.0, 0.0, 0.0
     model.zero_grad()
     eval_log = []
     best_score = 0
@@ -157,26 +156,27 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
         for step, (img_keys, batch) in tqdm(enumerate(train_dataloader)):
             batch = tuple(t.to(args.device) for t in batch)
 
-            if not args.scst:
-                model.train()
-                inputs = {'input_ids': batch[0], 'attention_mask': batch[1],
-                          'token_type_ids': batch[2], 'img_feats': batch[3],
-                          'masked_pos': batch[4], 'masked_ids': batch[5]
-                          }
-                outputs = model(**inputs)
-                loss, logits = outputs[:2]
-                masked_ids = inputs['masked_ids']
-                masked_ids = masked_ids[masked_ids != 0]
+            model.train()
+            inputs = {'input_ids': batch[0],
+                      'attention_mask': batch[1],
+                      'token_type_ids': batch[2],
+                      'img_feats': batch[3],
+                      'masked_pos': batch[4],
+                      'masked_ids': batch[5],
+                      'labels': batch[6]}
+            outputs = model(**inputs)
+            mask_loss, logits, clf_loss, clf_logits = outputs[:4]
+            loss = (2 * clf_loss + mask_loss) / 3
+            masked_ids = inputs['masked_ids']
+            masked_ids = masked_ids[masked_ids != 0]
 
-                logits = torch.max(logits, -1)[1].data  # argmax
-                batch_score = logits == masked_ids
+            logits = torch.max(logits, -1)[1].data  # argmax
+            clf_logits = torch.max(clf_logits, -1)[1].data  # argmax
 
-                batch_acc = torch.sum(batch_score.float()) / \
-                    torch.sum(inputs['masked_pos'])
-            else:
-                loss = scst_train_iter(
-                    args, train_dataset, model, scst_criterion, img_keys, batch, tokenizer)
-                batch_acc = scst_criterion.get_score()
+            batch_acc = torch.sum((logits == masked_ids).float()) / \
+                torch.sum(inputs['masked_pos'])
+            batch_clf_acc = torch.sum((clf_logits == inputs['labels']).float()) / \
+                len(inputs['labels'])
 
             if args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
@@ -186,7 +186,9 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), args.max_grad_norm)
             global_loss += loss.item()
-            global_acc += batch_acc
+            global_clf_loss += torch.mean(clf_loss).item()
+            global_acc += batch_acc.item()
+            global_clf_acc += batch_clf_acc.item()
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 global_step += 1
                 scheduler.step()
@@ -194,16 +196,13 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
                 model.zero_grad()
                 # Log metrics
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
-                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, loss: {:.4f} ({:.4f}), "
-                                "score: {:.4f} ({:.4f})".format(epoch, global_step,
-                                                                optimizer.param_groups[0]["lr"], loss, global_loss /
-                                                                global_step,
-                                                                batch_acc, global_acc / global_step)
-                                )
-
-                    # writer.add_scalar('Loss', loss, global_step)
-                    # writer.add_scalar('Acc', global_acc /
-                    #                   global_step, global_step)
+                    logger.info("Epoch: {}, global_step: {}, lr: {:.6f}, clf_loss: {:.4f} ({:.4f}), loss: {:.4f} ({:.4f}), mask_acc: {:.4f} ({:.4f}), clf_acc: {:.4f} ({:.4f})".format(
+                        epoch, global_step,
+                        optimizer.param_groups[0]["lr"],
+                        torch.mean(clf_loss), global_clf_loss / global_step,
+                        loss, global_loss / global_step,
+                        batch_acc, global_acc / global_step,
+                        batch_clf_acc, global_clf_acc / global_step))
 
                 if (args.local_rank in [-1, 0]) and (args.save_steps > 0 and global_step % args.save_steps == 0) or global_step == t_total:
                     checkpoint_dir = save_checkpoint(
@@ -224,63 +223,6 @@ def train(args, train_dataset, val_dataset, model, tokenizer):
                     #     with open(args.output_dir + '/eval_logs.json', 'w') as f:
                     #         json.dump(eval_log, f)
     return global_step, global_loss / global_step
-
-
-def scst_train_iter(args, train_dataset, model, scst_criterion, img_keys, batch, tokenizer):
-    cls_token_id, sep_token_id, pad_token_id, mask_token_id = tokenizer.convert_tokens_to_ids(
-        [tokenizer.cls_token, tokenizer.sep_token, tokenizer.pad_token,
-         tokenizer.mask_token]
-    )
-    inputs = {'is_decode': True,
-              'input_ids': batch[0], 'attention_mask': batch[1],
-              'token_type_ids': batch[2], 'img_feats': batch[3],
-              'masked_pos': batch[4],
-              'do_sample': False,
-              'bos_token_id': cls_token_id,
-              'pad_token_id': pad_token_id,
-              'eos_token_ids': [sep_token_id, pad_token_id],
-              'mask_token_id': mask_token_id,
-              # for adding od labels
-              'add_od_labels': args.add_od_labels, 'od_labels_start_posid': args.max_seq_a_length,
-
-              # hyperparameters of beam search
-              'max_length': args.max_seq_a_length,
-              'num_beams': 1,
-              "temperature": args.temperature,
-              "top_k": args.top_k,
-              "top_p": args.top_p,
-              "repetition_penalty": args.repetition_penalty,
-              "length_penalty": args.length_penalty,
-              "num_return_sequences": 1,
-              "num_keep_best": 1,
-              }
-
-    model.eval()
-    with torch.no_grad():
-        greedy_res_raw, _ = model(**inputs)
-        greedy_res_raw.squeeze_(1)  # batch_size * max_len
-
-    model.train()
-    inputs['do_sample'] = True
-    sample_res_raw, sample_logprobs = model(**inputs)
-    sample_res_raw.squeeze_(1)
-    sample_logprobs.squeeze_(1)
-    assert sample_logprobs.requires_grad == True
-    assert sample_res_raw.requires_grad == False
-
-    def _ids_to_captions(all_ids):
-        captions = []
-        for ids in all_ids:
-            c = tokenizer.decode(ids.tolist(), skip_special_tokens=True)
-            captions.append(c)
-        return captions
-
-    greedy_res = _ids_to_captions(greedy_res_raw)
-    sample_res = _ids_to_captions(sample_res_raw)
-    gt_res = [train_dataset.get_captions_by_key(k) for k in img_keys]
-
-    loss = scst_criterion(gt_res, greedy_res, sample_res, sample_logprobs)
-    return loss
 
 
 def get_predict_file(data_type, output_dir, args):
@@ -392,6 +334,11 @@ def test(args, test_dataset, model, tokenizer, predict_file):
                       "num_return_sequences": args.num_return_sequences,
                       "num_keep_best": args.num_keep_best,
                       }
+            inputs_clf = {
+                'input_ids': batch[0], 'attention_mask': batch[1],
+                'token_type_ids': batch[2], 'img_feats': batch[3],
+                'masked_pos': batch[4], 'labels': batch[5]
+            }
             if args.use_cbs:
                 inputs.update({'use_cbs': True,
                                'fsm': batch[5],
@@ -400,8 +347,11 @@ def test(args, test_dataset, model, tokenizer, predict_file):
                                })
             # captions, logprobs
             outputs = model(**inputs)
+            outputs_clf = model(**inputs_clf)
+            logits = outputs[2]
+            logits = logits.argmax(dim=1)
             all_generated = outputs[0]  # batch_size * num_keep_best * max_len
-            for img_key, input_ids, generated in zip(img_keys, batch[0], all_generated):
+            for img_key, input_ids, generated in zip(img_keys, inputs['input_ids'], all_generated):
                 print('INPUT: ', tokenizer.decode(input_ids.tolist()))
                 print('GEN.: ', tokenizer.decode(generated.tolist()[0]))
                 # res = []
@@ -476,23 +426,22 @@ def main():
 
     set_seed(args.seed, args.n_gpu)
 
-    # writer = SummaryWriter(log_dir=args.output_dir, flush_secs=60)
-
     # Load pretrained model and tokenizer
-    config_class, model_class, tokenizer_class = BertConfig, BertForImageCaptioning, BertTokenizer
+    config_class, model_class, tokenizer_class = BertConfig, BertForImageCaptioning_SeqClf, BertTokenizer
     if args.do_train:
         assert args.model_name_or_path is not None
         config = config_class.from_pretrained(args.config_name if args.config_name else
                                               args.model_name_or_path, num_labels=args.num_labels, finetuning_task='image_captioning')
-        if args.scst:
-            # avoid using too much memory
-            config.output_hidden_states = True
         tokenizer = tokenizer_class.from_pretrained(args.tokenizer_name if args.tokenizer_name
                                                     else args.model_name_or_path, do_lower_case=args.do_lower_case)
         config.img_feature_dim = args.img_feature_dim
         config.img_feature_type = args.img_feature_type
         config.hidden_dropout_prob = args.drop_out
-        config.loss_type = args.loss_type
+
+        config.code_voc = args.code_voc
+        config.classifier = args.classifier
+        config.cls_hidden_scale = args.cls_hidden_scale
+
         model = model_class.from_pretrained(args.model_name_or_path,
                                             from_tf=bool('.ckpt' in args.model_name_or_path), config=config)
     else:

@@ -14,11 +14,10 @@ import torch
 from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
 from tqdm import tqdm
 import logging
+import sys
 
-from oscar.utils.tsv_file import TSVFile
-from oscar.utils.tsv_file_ops import tsv_writer
-from oscar.utils.misc import (mkdir, set_seed,
-                              load_from_yaml_file, find_file_path_in_yaml)
+sys.path.insert(0, '..')
+from oscar.utils.misc import (mkdir, set_seed)
 from oscar.utils.cbs import ConstraintFilter, ConstraintBoxesReader
 from oscar.utils.cbs import FiniteStateMachineBuilder
 from transformers.pytorch_transformers import BertTokenizer, BertConfig
@@ -120,68 +119,23 @@ class CaptionTSVDataset(Dataset):
             [abs(bbox[:, 0] - bbox[:, 2]), abs(bbox[:, 1] - bbox[:, 3])]).reshape(-1, 2)
         return torch.cat([feat, bbox, pos_vec], dim=1)
 
+    def get_labels(self, idx):
+        return self.data['label_int'][idx]
+
     def __getitem__(self, idx):
         img_idx = self.get_image_global_index(idx)
         # print('img_idx', img_idx)
         # features = self.data['image_feat'][img_idx]
-        features = self.get_image_features(img_idx)
         input_text = self.generate_text_a(idx)
+        label = self.get_labels(idx)
+        features = self.get_image_features(img_idx)
         od_labels = self.get_od_labels(img_idx)
         example = self.tensorizer.tensorize_example(
-            input_text, features, text_b=od_labels)
+            input_text, features, text_b=od_labels, labels=label)
         return img_idx, example
 
     def __len__(self):
         return len(self.data['label'])
-
-
-class CaptionTSVDatasetWithConstraints(CaptionTSVDataset):
-    r"""
-    Providing inputs for inference with Constraint Beam Search
-
-    nms_threshold: float, optional (default = 0.85)
-        NMS threshold for suppressing generic object class names during constraint filtering,
-        for two boxes with IoU higher than this threshold, "dog" suppresses "animal".
-    max_given_constraints: int, optional (default = 3)
-        Maximum number of constraints which can be specified for CBS decoding. Constraints are
-        selected based on the prediction confidence score of their corresponding bounding boxes.
-    """
-
-    def __init__(
-        self, yaml_file,
-        nms_threshold=0.85,
-        max_given_constraints=3, **kwargs
-    ):
-        super().__init__(yaml_file, **kwargs)
-        boxes_tsvpath = find_file_path_in_yaml(self.cfg['cbs_box'], self.root)
-        constraint2tokens_tsvpath = find_file_path_in_yaml(
-            self.cfg['cbs_constraint'], self.root)
-        tokenforms_tsvpath = find_file_path_in_yaml(
-            self.cfg['cbs_tokenforms'], self.root)
-        hierarchy_jsonpath = find_file_path_in_yaml(
-            self.cfg['cbs_hierarchy'], self.root)
-
-        self._boxes_reader = ConstraintBoxesReader(boxes_tsvpath)
-        self._constraint_filter = ConstraintFilter(
-            hierarchy_jsonpath, nms_threshold, max_given_constraints
-        )
-        self._fsm_builder = FiniteStateMachineBuilder(self.tokenizer,
-                                                      constraint2tokens_tsvpath, tokenforms_tsvpath,
-                                                      max_given_constraints)
-
-    def __getitem__(self, index):
-        img_key, example = super().__getitem__(index)
-
-        # Apply constraint filtering to object class names.
-        constraint_boxes = self._boxes_reader[img_key]
-
-        candidates = self._constraint_filter(
-            constraint_boxes["boxes"], constraint_boxes["class_names"], constraint_boxes["scores"]
-        )
-        num_constraints = len(candidates)
-        fsm, nstates = self._fsm_builder.build(candidates)
-
-        return img_key, example + (fsm, num_constraints, )
 
 
 class CaptionTensorizer(object):
@@ -202,7 +156,7 @@ class CaptionTensorizer(object):
         self._triangle_mask = torch.tril(torch.ones((self.max_seq_len,
                                                      self.max_seq_len), dtype=torch.long))
 
-    def tensorize_example(self, text_a, img_feat, text_b=None,
+    def tensorize_example(self, text_a, img_feat, text_b=None, labels=None,
                           cls_token_segment_id=0, pad_token_segment_id=0,
                           sequence_a_segment_id=0, sequence_b_segment_id=1):
 
@@ -311,15 +265,16 @@ class CaptionTensorizer(object):
 
         input_ids = torch.tensor(input_ids, dtype=torch.long)
         segment_ids = torch.tensor(segment_ids, dtype=torch.long)
+        labels = torch.tensor(labels, dtype=torch.long)
 
         if self.is_train:
             masked_ids = torch.tensor(masked_ids, dtype=torch.long)
-            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids)
-        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos)
+            return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, masked_ids, labels)
+        return (input_ids, attention_mask, segment_ids, img_feat, masked_pos, labels)
 
 
 if __name__ == "__main__":
-    from run_captioning_args_vesnli import get_args
+    from seq_clf_gen_vesnli_args import get_args
     args = get_args()
     if args.do_train:
         data_type = 'train'
@@ -337,14 +292,14 @@ if __name__ == "__main__":
                                 tokenizer=tokenizer,
                                 is_train=args.do_train,
                                 args=args)
-    dataloader = DataLoader(dataset, batch_size=2048)
+    dataloader = DataLoader(dataset, batch_size=16)
 
     batch = next(iter(dataloader))
     img_keys, batch = batch
     if args.do_train:
-        input_ids, attention_mask, token_type_ids, img_feats, masked_pos, masked_ids = batch
+        input_ids, attention_mask, token_type_ids, img_feats, masked_pos, masked_ids, labels = batch
     else:
-        input_ids, attention_mask, token_type_ids, img_feats, masked_pos = batch
+        input_ids, attention_mask, token_type_ids, img_feats, masked_pos, labels = batch
 
     # print('img_keys', img_keys)
     print('input_ids', input_ids.shape, input_ids[0])
@@ -359,3 +314,4 @@ if __name__ == "__main__":
     print(token_type_ids[0].tolist().count(0),
           token_type_ids[0].tolist().count(1))
     print('img_feats', img_feats.shape)
+    print('labels', labels.shape, labels)
